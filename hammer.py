@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Flask MJPEG stream with custom YOLO11n traffic cone detection.
+Flask MJPEG stream with custom YOLO11n hammer detection.
 
-Captures live frames from the IMX500 camera via Picamera2, runs inference
-using the trained best.pt model, and streams annotated video over HTTP.
+Run: python hammer.py
+Stream: http://<pi_ip>:5001
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import signal
 import sys
 from pathlib import Path
 
-# Picamera2 is installed system-wide on Raspberry Pi OS; allow venv usage.
 if sys.prefix != sys.base_prefix:
     sys.path.insert(0, "/usr/lib/python3/dist-packages")
 
@@ -22,48 +21,45 @@ from flask import Flask, Response
 from picamera2 import MappedArray, Picamera2
 from ultralytics import YOLO
 
-# --- paths & detection settings ---
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "best.pt"
-TARGET_CLASS = "traffic_cone"
-CONFIDENCE = 0.5
+MODEL_PATH = BASE_DIR / "models" / "hammer.pt"
+TARGET_CLASS = "hammer"  # matches both "Hammer" and "hammer" in the model
+CONFIDENCE = 0.15
 FRAME_SIZE = (640, 480)
-INFERENCE_SIZE = 320  # smaller input = faster CPU inference on Pi 5
+INFERENCE_SIZE = 640
 JPEG_QUALITY = 85
-PORT = 5000
+PORT = 5001
 
 app = Flask(__name__)
 picam2: Picamera2 | None = None
 model: YOLO | None = None
-target_class_id: int | None = None
+target_class_ids: set[int] = set()
 
 
 def load_model() -> None:
-    """Load the custom YOLO weights and resolve the traffic_cone class id."""
-    global model, target_class_id
+    global model, target_class_ids
 
     print(f"Loading YOLO model from {MODEL_PATH}...")
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. "
-            "Place best.pt in the models/ folder next to app.py."
+            "Place hammer.pt in the models/ folder."
         )
 
     model = YOLO(str(MODEL_PATH))
-    target_class_id = None
-    for class_id, name in model.names.items():
-        if name == TARGET_CLASS:
-            target_class_id = int(class_id)
-            break
+    target_class_ids = {
+        int(class_id)
+        for class_id, name in model.names.items()
+        if name.lower() == TARGET_CLASS
+    }
 
-    if target_class_id is None:
+    if not target_class_ids:
         raise ValueError(f"Class '{TARGET_CLASS}' not found in model labels: {model.names}")
 
-    print(f"YOLO ready — detecting '{TARGET_CLASS}' (class {target_class_id})")
+    print(f"YOLO ready — detecting '{TARGET_CLASS}' (class ids {sorted(target_class_ids)})")
 
 
 def start_camera() -> None:
-    """Start Picamera2 with the same ISP preview pipeline used elsewhere in this project."""
     global picam2
 
     print("Starting IMX500 camera...")
@@ -79,7 +75,6 @@ def start_camera() -> None:
 
 
 def stop_camera() -> None:
-    """Release the camera so other apps can use it."""
     global picam2
     if picam2 is not None:
         try:
@@ -96,7 +91,6 @@ def shutdown(*_args) -> None:
 
 
 def capture_rgb_frame():
-    """Capture one colour-corrected RGB frame from the camera."""
     request = picam2.capture_request()
     try:
         with MappedArray(request, "main") as m:
@@ -105,10 +99,10 @@ def capture_rgb_frame():
         request.release()
 
 
-def detect_cones(frame) -> list[tuple[int, int, int, int, float]]:
-    """Run YOLO on a frame and return traffic_cone boxes as (x1, y1, x2, y2, conf)."""
+def detect_objects(frame_rgb) -> list[tuple[int, int, int, int, float]]:
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     results = model.predict(
-        frame,
+        frame_bgr,
         imgsz=INFERENCE_SIZE,
         conf=CONFIDENCE,
         verbose=False,
@@ -117,23 +111,18 @@ def detect_cones(frame) -> list[tuple[int, int, int, int, float]]:
 
     detections: list[tuple[int, int, int, int, float]] = []
     for box in results.boxes:
-        class_id = int(box.cls[0])
-        if class_id != target_class_id:
+        if int(box.cls[0]) not in target_class_ids:
             continue
-
         confidence = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         detections.append((x1, y1, x2, y2, confidence))
-
     return detections
 
 
 def draw_detections(frame, detections) -> None:
-    """Draw bounding boxes and labels on the RGB frame in-place."""
     for x1, y1, x2, y2, confidence in detections:
         label = f"{TARGET_CLASS} {confidence * 100:.0f}%"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 170, 60), 2)
         (text_width, text_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
         )
@@ -146,21 +135,15 @@ def draw_detections(frame, detections) -> None:
             cv2.FILLED,
         )
         cv2.putText(
-            frame,
-            label,
-            (x1 + 2, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (20, 20, 20),
-            2,
+            frame, label, (x1 + 2, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2,
         )
 
 
 def generate():
-    """Yield MJPEG frames with live YOLO detections drawn on each frame."""
     while True:
         frame = capture_rgb_frame()
-        detections = detect_cones(frame)
+        detections = detect_objects(frame)
         draw_detections(frame, detections)
 
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -184,7 +167,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Mars Rover — Traffic Cone Detection</title>
+        <title>Mars Rover — Hammer Detection</title>
         <style>
             body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
             h1 { margin-top: 1rem; }
@@ -193,8 +176,8 @@ def index():
         </style>
     </head>
     <body>
-        <h1>Mars Rover — Traffic Cone Detection</h1>
-        <p>Live YOLO detection for <strong>traffic_cone</strong> (confidence &ge; 50%)</p>
+        <h1>Mars Rover — Hammer Detection</h1>
+        <p>Live YOLO detection for <strong>hammer</strong> only</p>
         <img src="/video" width="640">
     </body>
     </html>

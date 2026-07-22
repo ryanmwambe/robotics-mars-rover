@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# Run the Mars Rover web stream with the project venv.
+# Run traffic cone detection (default stream on port 5000).
 cd "$(dirname "$0")"
-exec ./venv/bin/python app.py
+exec ./venv/bin/python traffic_cone.py "$@"
