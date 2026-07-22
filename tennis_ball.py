@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Flask MJPEG stream with custom YOLO11n hammer detection.
+Flask MJPEG stream with custom YOLO11n tennis ball detection.
 
-Run: python hammer.py
-Stream: http://<pi_ip>:5001
+Run: python tennis_ball.py
+Stream: http://<pi_ip>:5002
 """
 
 from __future__ import annotations
@@ -23,24 +23,24 @@ from picamera2 import MappedArray, Picamera2
 from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "hammer.pt"
-TARGET_CLASS = "hammer"  # matches both "Hammer" and "hammer" in the model
-CONFIDENCE = 0.25  # low enough for real hammer (~44%); ROI excludes stool legs
+MODEL_PATH = BASE_DIR / "models" / "tennis_ball.pt"
+TARGET_CLASS = "tennis-ball"
+CONFIDENCE = 0.15
 FRAME_SIZE = (640, 480)
 INFERENCE_SIZE = 640
 JPEG_QUALITY = 85
-PORT = 5001
+PORT = 5002
 
-# Search only the lower-center region where the hammer is placed for the competition.
-ROI_X_START = 0.15
-ROI_X_END = 0.85
-ROI_Y_START = 0.50
-
-# Reject vertical stool/table legs and tiny partial hits.
-MIN_ASPECT = 0.85
-MIN_BOX_WIDTH = 70
-MIN_BOX_AREA = 4000
-MIN_CENTER_Y_FRAC = 0.55
+# Tennis balls are round — allow slight perspective squash, reject legs and tiny hits.
+MIN_ASPECT = 0.55
+MAX_ASPECT = 2.20
+MIN_BOX_SIZE = 20
+MAX_BOX_SIZE = 120
+MIN_BOX_AREA = 350
+MAX_BOX_AREA = 12000
+MIN_CENTER_Y_FRAC = 0.40
+MIN_CENTER_X_FRAC = 0.12
+MAX_CENTER_X_FRAC = 0.88
 
 app = Flask(__name__)
 picam2: Picamera2 | None = None
@@ -55,14 +55,15 @@ def load_model() -> None:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. "
-            "Place hammer.pt in the models/ folder."
+            "Place tennis_ball.pt in the models/ folder."
         )
 
     model = YOLO(str(MODEL_PATH))
     target_class_ids = {
         int(class_id)
         for class_id, name in model.names.items()
-        if name.lower() == TARGET_CLASS
+        if name.lower().replace("_", "-") == TARGET_CLASS
+        or name.lower().replace("-", "_") == TARGET_CLASS.replace("-", "_")
     }
 
     if not target_class_ids:
@@ -111,43 +112,42 @@ def capture_rgb_frame():
         request.release()
 
 
-def _roi_bounds(frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
-    x1 = int(frame_width * ROI_X_START)
-    x2 = int(frame_width * ROI_X_END)
-    y1 = int(frame_height * ROI_Y_START)
-    return x1, y1, x2, frame_height
-
-
-def _pick_best_hammer(
+def _pick_best_ball(
     candidates: list[tuple[int, int, int, int, float]],
     frame_width: int,
     frame_height: int,
 ) -> list[tuple[int, int, int, int, float]]:
-    """Keep at most one hammer — reject legs and partial false positives."""
+    """Keep at most one tennis ball — prefer round, centered detections."""
     best: tuple[int, int, int, int, float] | None = None
     best_score = -1.0
     focus_x = frame_width / 2
-    focus_y = frame_height * 0.75
+    focus_y = frame_height * 0.65
 
     for x1, y1, x2, y2, confidence in candidates:
         box_w = x2 - x1
         box_h = y2 - y1
         aspect = box_w / max(box_h, 1)
         area = box_w * box_h
+        size = max(box_w, box_h)
         center_x = (x1 + x2) / 2
         center_y = (y1 + y2) / 2
 
-        if aspect < MIN_ASPECT:
+        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
             continue
-        if box_w < MIN_BOX_WIDTH:
+        if size < MIN_BOX_SIZE or size > MAX_BOX_SIZE:
             continue
-        if area < MIN_BOX_AREA:
+        if area < MIN_BOX_AREA or area > MAX_BOX_AREA:
             continue
         if center_y < frame_height * MIN_CENTER_Y_FRAC:
             continue
+        if center_x < frame_width * MIN_CENTER_X_FRAC:
+            continue
+        if center_x > frame_width * MAX_CENTER_X_FRAC:
+            continue
 
+        roundness = 1.0 - abs(1.0 - aspect)
         distance = math.hypot(center_x - focus_x, center_y - focus_y)
-        score = confidence * 100 + area / 500 - distance / 10
+        score = confidence * 100 + roundness * 20 + area / 800 - distance / 12
         if score > best_score:
             best_score = score
             best = (x1, y1, x2, y2, confidence)
@@ -158,11 +158,9 @@ def _pick_best_hammer(
 def detect_objects(frame_rgb) -> list[tuple[int, int, int, int, float]]:
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     frame_height, frame_width = frame_bgr.shape[:2]
-    roi_x1, roi_y1, roi_x2, roi_y2 = _roi_bounds(frame_width, frame_height)
-    roi_bgr = frame_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
 
     results = model.predict(
-        roi_bgr,
+        frame_bgr,
         imgsz=INFERENCE_SIZE,
         conf=CONFIDENCE,
         verbose=False,
@@ -176,17 +174,15 @@ def detect_objects(frame_rgb) -> list[tuple[int, int, int, int, float]]:
                 continue
             confidence = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            candidates.append(
-                (x1 + roi_x1, y1 + roi_y1, x2 + roi_x1, y2 + roi_y1, confidence)
-            )
+            candidates.append((x1, y1, x2, y2, confidence))
 
-    return _pick_best_hammer(candidates, frame_width, frame_height)
+    return _pick_best_ball(candidates, frame_width, frame_height)
 
 
 def draw_detections(frame, detections) -> None:
     for x1, y1, x2, y2, confidence in detections:
         label = f"{TARGET_CLASS} {confidence * 100:.0f}%"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 170, 60), 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 220, 60), 2)
         (text_width, text_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
         )
@@ -231,7 +227,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Mars Rover — Hammer Detection</title>
+        <title>Mars Rover — Tennis Ball Detection</title>
         <style>
             body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
             h1 { margin-top: 1rem; }
@@ -240,8 +236,8 @@ def index():
         </style>
     </head>
     <body>
-        <h1>Mars Rover — Hammer Detection</h1>
-        <p>Live YOLO detection for <strong>hammer</strong> only</p>
+        <h1>Mars Rover — Tennis Ball Detection</h1>
+        <p>Live YOLO detection for <strong>tennis-ball</strong> only</p>
         <img src="/video" width="640">
     </body>
     </html>
