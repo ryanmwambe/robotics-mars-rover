@@ -2,7 +2,7 @@
 """
 Mars Rover Challenge — precise detection for competition props:
   - light green tennis ball
-  - red traffic cone with white reflector band near the top
+  - red traffic cone with white reflector band
   - claw hammer (metal head + narrow wooden handle)
 
 Uses strict multi-cue OpenCV rules and rejects skin / furniture false positives.
@@ -16,12 +16,13 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 from flask import Flask, Response
-from picamera2 import Picamera2
+from picamera2 import MappedArray, Picamera2
 
 PORT = 5001
 FRAME_SIZE = (640, 480)
 MIN_DISPLAY_CONFIDENCE = 0.68
 MAX_PER_CLASS = 1
+CONE_ONLY = True  # set False when tennis ball / hammer detectors are ready
 
 app = Flask(__name__)
 
@@ -31,12 +32,22 @@ def start_camera():
     picam2 = Picamera2()
     picam2.configure(
         picam2.create_preview_configuration(
-            main={"size": FRAME_SIZE, "format": "RGB888"},
-            buffer_count=4,
+            main={"size": FRAME_SIZE},
+            buffer_count=12,
         )
     )
     picam2.start()
     print("Mars Rover detector running (strict OpenCV)")
+
+
+def capture_rgb_frame() -> np.ndarray:
+    """Capture one ISP-processed RGB frame (same pipeline quality as app.py)."""
+    request = picam2.capture_request()
+    try:
+        with MappedArray(request, "main") as m:
+            return m.array.copy()
+    finally:
+        request.release()
 
 
 @dataclass
@@ -161,80 +172,78 @@ def detect_tennis_balls(frame: np.ndarray, skin: np.ndarray) -> list[Detection]:
 
 
 def detect_traffic_cones(frame: np.ndarray, skin: np.ndarray) -> list[Detection]:
-    """Red tapered body with a white reflective band just above the red section."""
+    """
+    Red traffic cone with a white reflective band.
+
+    Finds the white stripe in the centre column, then locates red cone body
+    above (tip) and below (base), tolerating the gap between stripe and base.
+    """
+    h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    red = cv2.inRange(hsv, (0, 110, 70), (10, 255, 255))
-    red |= cv2.inRange(hsv, (170, 110, 70), (180, 255, 255))
+
+    white = cv2.inRange(hsv, (0, 0, 140), (180, 75, 255))
+    # Include orange-red hues — cone red spans H≈0-20 and H≈160-180
+    red = cv2.inRange(hsv, (0, 35, 40), (20, 255, 255))
+    red |= cv2.inRange(hsv, (160, 35, 40), (180, 255, 255))
     red = cv2.morphologyEx(red, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     red = cv2.morphologyEx(red, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    combined = red | white
 
-    white = cv2.inRange(hsv, (0, 0, 180), (180, 60, 255))
+    cx1, cx2 = int(w * 0.36), int(w * 0.64)
+    col_w = cx2 - cx1
+    row_white = np.count_nonzero(white[:, cx1:cx2], axis=1) / max(col_w, 1)
+    row_red = np.count_nonzero(red[:, cx1:cx2], axis=1) / max(col_w, 1)
 
-    detections: list[Detection] = []
-    contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    scan_y1, scan_y2 = int(h * 0.12), int(h * 0.58)
+    white_seg = row_white[scan_y1:scan_y2]
+    if white_seg.size == 0 or float(np.max(white_seg)) < 0.35:
+        return []
 
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 1500 or area > 90000:
-            continue
+    stripe_y = scan_y1 + int(np.argmax(white_seg))
+    band_ratio = float(row_white[stripe_y])
 
-        x, y, w, h = cv2.boundingRect(contour)
-        if h < 45 or w < 15:
-            continue
-        aspect = h / max(w, 1)
-        if aspect < 1.1:
-            continue
+    top_lo = max(int(h * 0.08), stripe_y - 150)
+    above = np.where(row_red[top_lo : stripe_y - 3] >= 0.10)[0]
+    top = top_lo + int(above[0]) if above.size else max(stripe_y - 80, top_lo)
 
-        box = (x, y, w, h)
-        if _overlap_ratio(skin, box) > 0.12:
-            continue
+    below_lo = stripe_y + 5
+    below_hi = min(h - 1, stripe_y + 185)
+    below = np.where(row_red[below_lo:below_hi] >= 0.12)[0]
+    if below.size:
+        bottom = below_lo + int(below[-1])
+    else:
+        below_loose = np.where(row_red[below_lo:below_hi] >= 0.06)[0]
+        bottom = below_lo + int(below_loose[-1]) if below_loose.size else stripe_y + 30
 
-        red_roi = red[y : y + h, x : x + w]
-        red_fill = float(np.count_nonzero(red_roi)) / max(red_roi.size, 1)
-        if red_fill < 0.25:
-            continue
+    if bottom - top < 45:
+        return []
 
-        # White reflector sits above the red body, not inside the red mask.
-        stripe_h = max(int(h * 0.45), 18)
-        stripe_y1 = max(y - stripe_h, 0)
-        stripe_y2 = y + min(int(h * 0.12), 20)
-        white_band = white[stripe_y1:stripe_y2, x : x + w]
-        white_ratio = float(np.count_nonzero(white_band)) / max(white_band.size, 1)
-        if white_ratio < 0.05:
-            continue
-        if white_ratio > 0.55:
-            continue
+    sub = combined[top : bottom + 1, cx1:cx2]
+    col_fill = np.count_nonzero(sub, axis=0) / max(sub.shape[0], 1)
+    cols = np.where(col_fill >= 0.08)[0]
+    if cols.size < 4:
+        return []
 
-        def row_width(mask_roi: np.ndarray, row: int) -> int:
-            if row < 0 or row >= mask_roi.shape[0]:
-                return 0
-            cols = np.where(mask_roi[row, :] > 0)[0]
-            return int(cols[-1] - cols[0]) if cols.size else 0
+    pad = 10
+    x1 = max(cx1 + int(cols[0]) - pad, 0)
+    x2 = min(cx1 + int(cols[-1]) + pad, w)
+    y1 = max(top - pad, 0)
+    y2 = min(bottom + pad, h)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 25 or bh < 50:
+        return []
 
-        top_w = row_width(red_roi, int(h * 0.15))
-        bottom_w = row_width(red_roi, int(h * 0.8))
-        if bottom_w <= 0 or top_w <= 0:
-            continue
-        if bottom_w < top_w * 1.04:
-            continue
+    box = (x1, y1, bw, bh)
 
-        full_y1 = stripe_y1
-        full_y2 = y + h
-        full_box = (x, full_y1, w, full_y2 - full_y1)
-        if _overlap_ratio(skin, full_box) > 0.12:
-            continue
-
-        score = min(
-            0.99,
-            0.42
-            + red_fill * 0.2
-            + white_ratio * 0.28
-            + min((bottom_w / top_w - 1.0), 0.8) * 0.12
-            + min(aspect / 3.0, 0.3) * 0.1,
-        )
-        detections.append(Detection("traffic cone", full_box, score))
-
-    return detections
+    body = red[y1:y2, x1:x2]
+    body_fill = float(np.count_nonzero(body)) / max(body.size, 1)
+    aspect = bh / max(bw, 1)
+    centre_score = 1.0 - abs((x1 + bw / 2) - w / 2) / (w * 0.25)
+    score = min(
+        0.99,
+        0.38 + body_fill * 0.22 + band_ratio * 0.22 + centre_score * 0.10 + min(aspect, 2.0) * 0.08,
+    )
+    return [Detection("traffic cone", box, score)]
 
 
 def detect_hammers(frame: np.ndarray, skin: np.ndarray) -> list[Detection]:
@@ -327,9 +336,10 @@ def detect_all(frame: np.ndarray) -> list[Detection]:
     skin = _skin_mask(hsv)
 
     detections: list[Detection] = []
-    detections.extend(detect_tennis_balls(frame, skin))
     detections.extend(detect_traffic_cones(frame, skin))
-    detections.extend(detect_hammers(frame, skin))
+    if not CONE_ONLY:
+        detections.extend(detect_tennis_balls(frame, skin))
+        detections.extend(detect_hammers(frame, skin))
     return _merge_overlapping(detections)
 
 
@@ -353,7 +363,7 @@ def draw_detections(frame: np.ndarray, detections: list[Detection]) -> np.ndarra
 
 def generate():
     while True:
-        frame = picam2.capture_array()
+        frame = capture_rgb_frame()
         detections = detect_all(frame)
         frame = draw_detections(frame, detections)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -384,7 +394,7 @@ def index():
     </head>
     <body>
         <h1>Mars Rover Challenge</h1>
-        <p>Strict detection: light green tennis ball, red cone with white reflector, claw hammer.</p>
+        <p>Traffic cone detection: red cone with white reflector band.</p>
         <img src="/video" width="640">
     </body>
     </html>

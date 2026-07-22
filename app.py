@@ -1,182 +1,172 @@
 #!/usr/bin/env python3
 """
-Flask MJPEG stream with IMX500 object detection.
+Flask MJPEG stream with custom YOLO11n traffic cone detection.
 
-Uses the same detection pipeline as the official Raspberry Pi demo:
-  ~/picamera2/examples/imx500/imx500_object_detection_demo.py
+Captures live frames from the IMX500 camera via Picamera2, runs inference
+using the trained best.pt model, and streams annotated video over HTTP.
 """
 
+from __future__ import annotations
+
+import atexit
+import signal
 import sys
-from functools import lru_cache
 from pathlib import Path
+
+# Picamera2 is installed system-wide on Raspberry Pi OS; allow venv usage.
+if sys.prefix != sys.base_prefix:
+    sys.path.insert(0, "/usr/lib/python3/dist-packages")
 
 import cv2
 from flask import Flask, Response
-
 from picamera2 import MappedArray, Picamera2
-from picamera2.devices import IMX500
-from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_detection
+from ultralytics import YOLO
 
-MODEL = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
-COCO_LABELS = Path("/home/pi/picamera2/examples/imx500/assets/coco_labels.txt")
-
-THRESHOLD = 0.55
-IOU = 0.65
-MAX_DETECTIONS = 10
-
-last_detections = []
+# --- paths & detection settings ---
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "best.pt"
+TARGET_CLASS = "traffic_cone"
+CONFIDENCE = 0.5
+FRAME_SIZE = (640, 480)
+INFERENCE_SIZE = 320  # smaller input = faster CPU inference on Pi 5
+JPEG_QUALITY = 85
+PORT = 5000
 
 app = Flask(__name__)
-
-print("Loading IMX500...")
-imx500 = IMX500(MODEL)
-
-intrinsics = imx500.network_intrinsics
-if not intrinsics:
-    intrinsics = NetworkIntrinsics()
-    intrinsics.task = "object detection"
-elif intrinsics.task != "object detection":
-    print("Network is not an object detection task", file=sys.stderr)
-    sys.exit(1)
-
-if intrinsics.labels is None:
-    with open(COCO_LABELS, "r") as f:
-        intrinsics.labels = f.read().splitlines()
-intrinsics.update_with_defaults()
-
-picam2 = Picamera2(imx500.camera_num)
-config = picam2.create_preview_configuration(
-    controls={"FrameRate": intrinsics.inference_rate},
-    buffer_count=12,
-)
-
-imx500.show_network_fw_progress_bar()
-picam2.start(config)
-
-if intrinsics.preserve_aspect_ratio:
-    imx500.set_auto_aspect_ratio()
-
-print("Camera running with IMX500 object detection")
+picam2: Picamera2 | None = None
+model: YOLO | None = None
+target_class_id: int | None = None
 
 
-class Detection:
-    def __init__(self, coords, category, conf, metadata):
-        """Create a Detection object, recording the bounding box, category and confidence."""
-        self.category = category
-        self.conf = conf
-        self.box = imx500.convert_inference_coords(coords, metadata, picam2)
+def load_model() -> None:
+    """Load the custom YOLO weights and resolve the traffic_cone class id."""
+    global model, target_class_id
+
+    print(f"Loading YOLO model from {MODEL_PATH}...")
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model not found at {MODEL_PATH}. "
+            "Place best.pt in the models/ folder next to app.py."
+        )
+
+    model = YOLO(str(MODEL_PATH))
+    target_class_id = None
+    for class_id, name in model.names.items():
+        if name == TARGET_CLASS:
+            target_class_id = int(class_id)
+            break
+
+    if target_class_id is None:
+        raise ValueError(f"Class '{TARGET_CLASS}' not found in model labels: {model.names}")
+
+    print(f"YOLO ready — detecting '{TARGET_CLASS}' (class {target_class_id})")
 
 
-def parse_detections(metadata: dict):
-    """Parse the output tensor into a number of detected objects, scaled to the ISP output."""
-    global last_detections
-    bbox_normalization = intrinsics.bbox_normalization
-    bbox_order = intrinsics.bbox_order
+def start_camera() -> None:
+    """Start Picamera2 with the same ISP preview pipeline used elsewhere in this project."""
+    global picam2
 
-    np_outputs = imx500.get_outputs(metadata, add_batch=True)
-    input_w, input_h = imx500.get_input_size()
-    if np_outputs is None:
-        return last_detections
-    if intrinsics.postprocess == "nanodet":
-        boxes, scores, classes = postprocess_nanodet_detection(
-            outputs=np_outputs[0], conf=THRESHOLD, iou_thres=IOU, max_out_dets=MAX_DETECTIONS
-        )[0]
-        from picamera2.devices.imx500.postprocess import scale_boxes
-
-        boxes = scale_boxes(boxes, 1, 1, input_h, input_w, False, False)
-    else:
-        boxes, scores, classes = np_outputs[0][0], np_outputs[1][0], np_outputs[2][0]
-        if bbox_normalization:
-            boxes = boxes / input_h
-
-        if bbox_order == "xy":
-            boxes = boxes[:, [1, 0, 3, 2]]
-
-    last_detections = [
-        Detection(box, category, score, metadata)
-        for box, score, category in zip(boxes, scores, classes)
-        if score > THRESHOLD
-    ]
-    return last_detections
+    print("Starting IMX500 camera...")
+    picam2 = Picamera2()
+    picam2.configure(
+        picam2.create_preview_configuration(
+            main={"size": FRAME_SIZE},
+            buffer_count=12,
+        )
+    )
+    picam2.start()
+    print(f"Camera running at {FRAME_SIZE[0]}x{FRAME_SIZE[1]}")
 
 
-@lru_cache
-def get_labels():
-    labels = intrinsics.labels
+def stop_camera() -> None:
+    """Release the camera so other apps can use it."""
+    global picam2
+    if picam2 is not None:
+        try:
+            picam2.stop()
+            picam2.close()
+        except Exception:
+            pass
+        picam2 = None
+        print("Camera stopped.")
 
-    if intrinsics.ignore_dash_labels:
-        labels = [label for label in labels if label and label != "-"]
-    return labels
+
+def shutdown(*_args) -> None:
+    stop_camera()
 
 
-def draw_detections_on_request(request, detections):
-    """Draw detections using MappedArray, matching the official pre_callback path."""
-    labels = get_labels()
-    with MappedArray(request, "main") as m:
-        for detection in detections:
-            x, y, w, h = detection.box
-            label = f"{labels[int(detection.category)]} {detection.conf * 100:.1f}%"
+def capture_rgb_frame():
+    """Capture one colour-corrected RGB frame from the camera."""
+    request = picam2.capture_request()
+    try:
+        with MappedArray(request, "main") as m:
+            return m.array.copy()
+    finally:
+        request.release()
 
-            (text_width, text_height), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-            )
-            text_x = x + 5
-            text_y = y + 15
 
-            overlay = m.array.copy()
-            cv2.rectangle(
-                overlay,
-                (text_x, text_y - text_height),
-                (text_x + text_width, text_y + baseline),
-                (255, 255, 255),
-                cv2.FILLED,
-            )
+def detect_cones(frame) -> list[tuple[int, int, int, int, float]]:
+    """Run YOLO on a frame and return traffic_cone boxes as (x1, y1, x2, y2, conf)."""
+    results = model.predict(
+        frame,
+        imgsz=INFERENCE_SIZE,
+        conf=CONFIDENCE,
+        verbose=False,
+        device="cpu",
+    )[0]
 
-            alpha = 0.30
-            cv2.addWeighted(overlay, alpha, m.array, 1 - alpha, 0, m.array)
+    detections: list[tuple[int, int, int, int, float]] = []
+    for box in results.boxes:
+        class_id = int(box.cls[0])
+        if class_id != target_class_id:
+            continue
 
-            cv2.putText(
-                m.array,
-                label,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 255),
-                1,
-            )
+        confidence = float(box.conf[0])
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        detections.append((x1, y1, x2, y2, confidence))
 
-            cv2.rectangle(m.array, (x, y), (x + w, y + h), (0, 255, 0), thickness=2)
+    return detections
 
-        if intrinsics.preserve_aspect_ratio:
-            b_x, b_y, b_w, b_h = imx500.get_roi_scaled(request)
-            color = (255, 0, 0)
-            cv2.putText(
-                m.array,
-                "ROI",
-                (b_x + 5, b_y + 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-            )
-            cv2.rectangle(m.array, (b_x, b_y), (b_x + b_w, b_y + b_h), color, thickness=2)
 
-        return m.array.copy()
+def draw_detections(frame, detections) -> None:
+    """Draw bounding boxes and labels on the RGB frame in-place."""
+    for x1, y1, x2, y2, confidence in detections:
+        label = f"{TARGET_CLASS} {confidence * 100:.0f}%"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+        )
+        text_y = max(y1 - 8, text_height + 4)
+        cv2.rectangle(
+            frame,
+            (x1, text_y - text_height - 4),
+            (x1 + text_width + 4, text_y + baseline),
+            (255, 255, 255),
+            cv2.FILLED,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 2, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (20, 20, 20),
+            2,
+        )
 
 
 def generate():
-    """Yield MJPEG frames with live IMX500 detections drawn on each frame."""
+    """Yield MJPEG frames with live YOLO detections drawn on each frame."""
     while True:
-        request = picam2.capture_request()
-        try:
-            metadata = request.get_metadata()
-            detections = parse_detections(metadata)
-            frame = draw_detections_on_request(request, detections)
-        finally:
-            request.release()
+        frame = capture_rgb_frame()
+        detections = detect_cones(frame)
+        draw_detections(frame, detections)
 
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        ok, jpeg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        ok, jpeg = cv2.imencode(
+            ".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        )
         if not ok:
             continue
 
@@ -194,15 +184,17 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>IMX500 Object Detection</title>
+        <title>Mars Rover — Traffic Cone Detection</title>
         <style>
             body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
             h1 { margin-top: 1rem; }
+            p { color: #aaa; max-width: 680px; margin: 0.5rem auto 1rem; line-height: 1.4; }
             img { border: 2px solid #333; max-width: 100%; }
         </style>
     </head>
     <body>
-        <h1>IMX500 Object Detection</h1>
+        <h1>Mars Rover — Traffic Cone Detection</h1>
+        <p>Live YOLO detection for <strong>traffic_cone</strong> (confidence &ge; 50%)</p>
         <img src="/video" width="640">
     </body>
     </html>
@@ -211,11 +203,20 @@ def index():
 
 @app.route("/video")
 def video():
-    return Response(
-        generate(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    atexit.register(shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    try:
+        load_model()
+        start_camera()
+        print(f"Web stream: http://0.0.0.0:{PORT}")
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        shutdown()
+        sys.exit(1)
