@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 .cache/
+debug_balloons/
+.git.corrupt/
 *.jpg
 *.png
 *.mp4
