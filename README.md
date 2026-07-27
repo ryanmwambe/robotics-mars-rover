@@ -102,7 +102,7 @@ Or use the helper for traffic cones:
 
 ## Balloon detection (hybrid YOLO + HSV)
 
-The competition requires five balloons in a fixed row:
+For the Mars Rover SA challenge, the rover drives up to **one balloon at a time on the ground**. The script detects whatever balloon is currently in front of the camera and reports its colour:
 
 | Label on screen | Colour |
 |-----------------|--------|
@@ -122,22 +122,20 @@ The competition requires five balloons in a fixed row:
 
 ### Pipeline
 
-1. **YOLO (shape)** — Each balloon position has a dedicated model. A cropped region around the expected location is scanned for a round balloon shape.
-2. **HSV (colour)** — Pixels inside each YOLO box are sampled; the dominant colour vote becomes the label (`yellow balloon`, etc.).
-3. **Combined score** — `55%` shape confidence + `45%` colour vote ratio.
-
-Search windows assume the five balloons stay in a left-to-right row on the table. If you move them significantly, adjust `SEARCH_WINDOWS` in `balloon.py`.
+1. **YOLO (shape)** — All five shape models scan the full camera frame for round balloon shapes.
+2. **HSV (colour)** — Pixels inside each YOLO box are sampled; the dominant colour vote becomes the label.
+3. **Best match** — The largest, most centred, most colour-certain detection is returned as the balloon in front.
 
 ### Calibration / test
 
-With all five balloons in front of the camera:
+Hold any balloon in front of the camera:
 
 ```bash
 source venv/bin/activate
 python calibrate_balloons.py
 ```
 
-This captures one frame, runs detection, saves debug images to `debug_balloons/`, and reports `Detected N/5`. Exit code `1` if any balloon is missing.
+This captures one frame, runs detection, saves debug images to `debug_balloons/`, and reports what was found. Exit code `1` if nothing is detected.
 
 ---
 
