@@ -1,4 +1,15 @@
+# Core (install with: venv/bin/pip install -r requirements.txt)
 flask
 opencv-python
-picamera2
+torch==2.7.1
+torchvision==0.22.1
+matplotlib
+pyyaml
+ultralytics-thop
+
+# Install separately to avoid pulling CUDA torch + polars/nvidia-ml-py:
+#   venv/bin/pip install ultralytics --no-deps
 ultralytics
+
+# picamera2: use system package (already installed)
+#   sudo apt install python3-picamera2

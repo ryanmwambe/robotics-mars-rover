@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Flask MJPEG stream with custom YOLO11n multi-color balloon detection.
+Flask MJPEG stream with HSV color-based balloon detection.
 
-Detects up to one balloon per color: red, white, yellow, blue, black.
+Finds round blobs in red, white, yellow, blue, and black — no ML model needed.
 
 Run: python balloon.py
 Stream: http://<pi_ip>:5003
@@ -14,28 +14,39 @@ import atexit
 import math
 import signal
 import sys
-from pathlib import Path
 
 if sys.prefix != sys.base_prefix:
     sys.path.insert(0, "/usr/lib/python3/dist-packages")
 
 import cv2
+import numpy as np
 from flask import Flask, Response
 from picamera2 import MappedArray, Picamera2
-from ultralytics import YOLO
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "balloon.pt"
-CONFIDENCE = 0.15
 FRAME_SIZE = (640, 480)
-INFERENCE_SIZE = 640
 JPEG_QUALITY = 85
 PORT = 5003
 
-# One detection per color — keep the highest-confidence box for each.
-BALLOON_COLORS = ("red", "white", "yellow", "blue", "black")
+# HSV ranges: (lower, upper) — OpenCV uses H 0-179.
+COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]] = {
+    "red": [
+        ((0, 120, 70), (10, 255, 255)),
+        ((170, 120, 70), (179, 255, 255)),
+    ],
+    "yellow": [
+        ((18, 100, 100), (35, 255, 255)),
+    ],
+    "blue": [
+        ((95, 100, 70), (130, 255, 255)),
+    ],
+    "white": [
+        ((0, 0, 180), (179, 45, 255)),
+    ],
+    "black": [
+        ((0, 0, 0), (179, 255, 55)),
+    ],
+}
 
-# BGR draw colors and label text colors for each balloon color.
 COLOR_STYLES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
     "red": ((0, 0, 255), (255, 255, 255)),
     "white": ((220, 220, 220), (20, 20, 20)),
@@ -44,71 +55,14 @@ COLOR_STYLES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
     "black": ((60, 60, 60), (255, 255, 255)),
 }
 
-# Balloons are round — reject elongated false positives.
-MIN_ASPECT = 0.50
-MAX_ASPECT = 2.00
-MIN_BOX_SIZE = 25
-MAX_BOX_SIZE = 200
-MIN_BOX_AREA = 500
-MAX_BOX_AREA = 25000
+MIN_AREA = 800
+MAX_AREA = 40000
+MIN_CIRCULARITY = 0.45
+MIN_ASPECT = 0.55
+MAX_ASPECT = 1.80
 
 app = Flask(__name__)
 picam2: Picamera2 | None = None
-model: YOLO | None = None
-# Maps normalized color name -> set of YOLO class ids.
-color_class_ids: dict[str, set[int]] = {}
-
-
-def _normalize_label(name: str) -> str:
-    return name.lower().replace("_", "-").replace(" ", "-")
-
-
-def _color_from_label(name: str) -> str | None:
-    """Match model class names like 'red', 'red-balloon', 'balloon_red', etc."""
-    normalized = _normalize_label(name)
-    for color in BALLOON_COLORS:
-        variants = {
-            color,
-            f"{color}-balloon",
-            f"balloon-{color}",
-            f"{color}_balloon",
-            f"balloon_{color}",
-        }
-        if normalized in variants:
-            return color
-    return None
-
-
-def load_model() -> None:
-    global model, color_class_ids
-
-    print(f"Loading YOLO model from {MODEL_PATH}...")
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model not found at {MODEL_PATH}. "
-            "Place balloon.pt in the models/ folder."
-        )
-
-    model = YOLO(str(MODEL_PATH))
-    color_class_ids = {color: set() for color in BALLOON_COLORS}
-
-    for class_id, name in model.names.items():
-        color = _color_from_label(name)
-        if color is not None:
-            color_class_ids[color].add(int(class_id))
-
-    found = {color: ids for color, ids in color_class_ids.items() if ids}
-    if not found:
-        raise ValueError(
-            f"No balloon color classes found in model labels: {model.names}. "
-            f"Expected classes named like: {', '.join(BALLOON_COLORS)}"
-        )
-
-    print("YOLO ready — balloon colors detected:")
-    for color in BALLOON_COLORS:
-        ids = sorted(color_class_ids[color])
-        if ids:
-            print(f"  {color}: class ids {ids}")
 
 
 def start_camera() -> None:
@@ -151,91 +105,71 @@ def capture_rgb_frame():
         request.release()
 
 
-def _class_id_to_color(class_id: int) -> str | None:
-    for color, ids in color_class_ids.items():
-        if class_id in ids:
-            return color
-    return None
+def _color_mask(hsv: np.ndarray, color: str) -> np.ndarray:
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in COLOR_RANGES[color]:
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, np.array(lower), np.array(upper)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
 
 
-def _passes_shape_filter(
-    x1: int, y1: int, x2: int, y2: int,
-) -> bool:
-    box_w = x2 - x1
-    box_h = y2 - y1
-    aspect = box_w / max(box_h, 1)
-    area = box_w * box_h
-    size = max(box_w, box_h)
-
-    if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
-        return False
-    if size < MIN_BOX_SIZE or size > MAX_BOX_SIZE:
-        return False
-    if area < MIN_BOX_AREA or area > MAX_BOX_AREA:
-        return False
-    return True
-
-
-def _pick_best_per_color(
-    candidates: list[tuple[str, int, int, int, int, float]],
+def _find_best_blob(
+    mask: np.ndarray,
     frame_width: int,
     frame_height: int,
-) -> list[tuple[str, int, int, int, int, float]]:
-    """Keep at most one balloon per color — prefer round, confident detections."""
-    best_by_color: dict[str, tuple[str, int, int, int, int, float]] = {}
+) -> tuple[int, int, int, int, float] | None:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best: tuple[int, int, int, int, float] | None = None
+    best_score = -1.0
     focus_x = frame_width / 2
     focus_y = frame_height * 0.55
 
-    for detection in candidates:
-        color, x1, y1, x2, y2, confidence = detection
-        if not _passes_shape_filter(x1, y1, x2, y2):
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MIN_AREA or area > MAX_AREA:
             continue
 
-        box_w = x2 - x1
-        box_h = y2 - y1
-        aspect = box_w / max(box_h, 1)
-        area = box_w * box_h
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        if circularity < MIN_CIRCULARITY:
+            continue
 
-        roundness = 1.0 - abs(1.0 - aspect)
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect = w / max(h, 1)
+        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+            continue
+
+        center_x = x + w / 2
+        center_y = y + h / 2
         distance = math.hypot(center_x - focus_x, center_y - focus_y)
-        score = confidence * 100 + roundness * 15 + area / 1000 - distance / 15
+        score = circularity * 50 + area / 500 - distance / 20
 
-        current = best_by_color.get(color)
-        if current is None or score > current[-1]:
-            best_by_color[color] = (color, x1, y1, x2, y2, confidence, score)
+        if score > best_score:
+            best_score = score
+            confidence = min(0.99, 0.5 + circularity * 0.4 + area / MAX_AREA * 0.1)
+            best = (x, y, x + w, y + h, confidence)
 
-    return [
-        (color, x1, y1, x2, y2, confidence)
-        for color, x1, y1, x2, y2, confidence, _score in best_by_color.values()
-    ]
+    return best
 
 
 def detect_objects(frame_rgb) -> list[tuple[str, int, int, int, int, float]]:
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    frame_height, frame_width = frame_bgr.shape[:2]
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    frame_height, frame_width = hsv.shape[:2]
 
-    results = model.predict(
-        frame_bgr,
-        imgsz=INFERENCE_SIZE,
-        conf=CONFIDENCE,
-        verbose=False,
-        device="cpu",
-    )[0]
+    detections: list[tuple[str, int, int, int, int, float]] = []
+    for color in COLOR_RANGES:
+        mask = _color_mask(hsv, color)
+        blob = _find_best_blob(mask, frame_width, frame_height)
+        if blob is not None:
+            x1, y1, x2, y2, confidence = blob
+            detections.append((color, x1, y1, x2, y2, confidence))
 
-    candidates: list[tuple[str, int, int, int, int, float]] = []
-    if results.boxes is not None:
-        for box in results.boxes:
-            class_id = int(box.cls[0])
-            color = _class_id_to_color(class_id)
-            if color is None:
-                continue
-            confidence = float(box.conf[0])
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            candidates.append((color, x1, y1, x2, y2, confidence))
-
-    return _pick_best_per_color(candidates, frame_width, frame_height)
+    return detections
 
 
 def draw_detections(frame, detections) -> None:
@@ -284,7 +218,7 @@ def generate():
 
 @app.route("/")
 def index():
-    colors = ", ".join(BALLOON_COLORS)
+    colors = ", ".join(COLOR_RANGES)
     return f"""
     <!DOCTYPE html>
     <html>
@@ -299,7 +233,7 @@ def index():
     </head>
     <body>
         <h1>Mars Rover — Balloon Detection</h1>
-        <p>Live YOLO detection for <strong>{colors}</strong> balloons</p>
+        <p>Color-based detection for <strong>{colors}</strong> balloons (no model file needed)</p>
         <img src="/video" width="640">
     </body>
     </html>
@@ -317,9 +251,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        load_model()
         start_camera()
-        print(f"Web stream: http://0.0.0.0:{PORT}")
+        print(f"Balloon color detection ready — stream: http://0.0.0.0:{PORT}")
         app.run(host="0.0.0.0", port=PORT, threaded=True)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
