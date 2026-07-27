@@ -48,19 +48,14 @@ def main() -> None:
     balloon.draw_detections(annotated, detections)
     cv2.imwrite(str(OUT / "detections.jpg"), cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
 
-    expected = {cfg["label"] for cfg in balloon.BALLOON_COLORS.values()}
-    found = {label for label, *_ in detections}
-
-    print(f"Detected {len(detections)}/5:")
+    print(f"Detected {len(detections)} balloon(s):")
     for label, x1, y1, x2, y2, conf in detections:
         print(f"  {label}: ({x1},{y1})-({x2},{y2}) conf={conf:.2f}")
 
-    missing = expected - found
-    if missing:
-        print("Missing:", ", ".join(sorted(missing)))
+    if not detections:
+        print("No balloon detected — hold a balloon in front of the camera and retry.")
         sys.exit(1)
 
-    print("All 5 balloons detected.")
     print(f"Saved debug images to {OUT}")
 
 

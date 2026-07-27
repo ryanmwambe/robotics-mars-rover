@@ -2,8 +2,11 @@
 """
 Flask MJPEG stream with hybrid balloon detection.
 
-YOLO finds balloon shapes (ignores non-balloon objects).
+YOLO finds balloon shapes anywhere in the camera view.
 HSV classifies the color inside each detected balloon.
+
+Designed for the Mars Rover SA challenge — balloons on the ground
+in front of the rover, one colour at a time.
 
 Run: python balloon.py
 Stream: http://<pi_ip>:5003
@@ -12,6 +15,7 @@ Stream: http://<pi_ip>:5003
 from __future__ import annotations
 
 import atexit
+import math
 import os
 import signal
 import sys
@@ -33,28 +37,27 @@ MODELS_DIR = BASE_DIR / "models" / "ballons" / "models"
 
 FRAME_SIZE = (640, 480)
 INFERENCE_SIZE = 640
-CROP_INFERENCE_SIZE = 320
-SHAPE_CONFIDENCE = 0.08
-MIN_COLOR_VOTE = 0.18
+SHAPE_CONFIDENCE = 0.02  # models score ~0.02 on real balloons
+MIN_COLOR_VOTE = 0.35
 JPEG_QUALITY = 85
 PORT = 5003
 
-# Search windows: (cx, cy, radius, shape_model_file)
-SEARCH_WINDOWS: list[tuple[int, int, int, str]] = [
-    (228, 265, 75, "light_blue_balloon.pt"),
-    (350, 275, 80, "pink_balloon.pt"),
-    (408, 275, 75, "yellow_balloon.pt"),
-    (483, 265, 80, "white_balloon.pt"),
-    (554, 265, 80, "navy_blue_balloon.pt"),
-]
-
-# Table region — ignore ceiling, floor, and background.
-ROI_X1, ROI_Y1, ROI_X2, ROI_Y2 = 120, 170, 625, 345
-MIN_BOX_AREA = 1200
-MAX_BOX_AREA = 40000
-MIN_ASPECT = 0.45
-MAX_ASPECT = 2.0
+# Accept balloons anywhere in frame (ground, close-up testing, etc.).
+ROI_MARGIN = 8
+MIN_BOX_AREA = 800
+MAX_BOX_AREA = 120000
+MIN_ASPECT = 0.35
+MAX_ASPECT = 2.5
 NMS_IOU = 0.45
+MAX_DETECTIONS = 3  # report the best balloon(s) currently in view
+
+SHAPE_MODELS = (
+    "light_blue_balloon.pt",
+    "pink_balloon.pt",
+    "yellow_balloon.pt",
+    "white_balloon.pt",
+    "navy_blue_balloon.pt",
+)
 
 BALLOON_COLORS: dict[str, dict] = {
     "yellow": {
@@ -97,15 +100,14 @@ def load_models() -> None:
     if not MODELS_DIR.is_dir():
         raise FileNotFoundError(f"Model directory not found: {MODELS_DIR}")
 
-    needed = {entry[3] for entry in SEARCH_WINDOWS}
-    for model_name in sorted(needed):
+    for model_name in SHAPE_MODELS:
         model_path = MODELS_DIR / model_name
         if not model_path.exists():
             raise FileNotFoundError(f"Model not found: {model_path}")
         print(f"Loading shape model {model_name}...")
         shape_models[model_name] = YOLO(str(model_path))
 
-    print("Hybrid detection ready — YOLO shape + HSV color")
+    print("Hybrid detection ready — full-frame YOLO shape + HSV color")
 
 
 def start_camera() -> None:
@@ -160,14 +162,18 @@ def _box_area(x1: int, y1: int, x2: int, y2: int) -> int:
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
-def _box_in_roi(x1: int, y1: int, x2: int, y2: int) -> bool:
+def _box_valid(x1: int, y1: int, x2: int, y2: int, frame_width: int, frame_height: int) -> bool:
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2
-    if cx < ROI_X1 or cx > ROI_X2 or cy < ROI_Y1 or cy > ROI_Y2:
+    if cx < ROI_MARGIN or cy < ROI_MARGIN:
         return False
+    if cx > frame_width - ROI_MARGIN or cy > frame_height - ROI_MARGIN:
+        return False
+
     area = _box_area(x1, y1, x2, y2)
     if area < MIN_BOX_AREA or area > MAX_BOX_AREA:
         return False
+
     w = max(x2 - x1, 1)
     h = max(y2 - y1, 1)
     aspect = w / h
@@ -201,15 +207,16 @@ def _nms_boxes(
 
 
 def _classify_hsv_pixel(h: int, s: int, v: int) -> str | None:
-    if 25 <= h <= 38 and s >= 130 and v >= 140:
+    # Allow bright specular highlights on shiny latex balloons (high V, high S).
+    if 22 <= h <= 40 and s >= 80 and v >= 100:
         return "yellow"
-    if 138 <= h <= 172 and v >= 160 and s <= 175:
+    if 135 <= h <= 175 and s >= 40 and v >= 100:
         return "pink"
-    if 108 <= h <= 118 and s >= 185 and 55 <= v <= 175:
+    if 105 <= h <= 125 and s >= 120 and v <= 180:
         return "black"
-    if 80 <= h <= 112 and 20 <= s <= 200 and 25 <= v <= 210:
+    if 68 <= h <= 118 and s >= 15 and v >= 20:
         return "light_blue"
-    if v >= 220 and s <= 85:
+    if v >= 180 and s <= 90:
         return "white"
     return None
 
@@ -228,8 +235,8 @@ def _classify_balloon_color(
     y2 = max(y1 + 1, min(y2, h))
 
     patch = hsv[y1:y2, x1:x2]
-    margin_x = max(1, int((x2 - x1) * 0.18))
-    margin_y = max(1, int((y2 - y1) * 0.18))
+    margin_x = max(1, int((x2 - x1) * 0.15))
+    margin_y = max(1, int((y2 - y1) * 0.15))
     center = patch[margin_y:-margin_y or None, margin_x:-margin_x or None]
     if center.size == 0:
         center = patch
@@ -245,36 +252,42 @@ def _classify_balloon_color(
         return None, 0.0
 
     best_key = max(votes, key=votes.get)
-    vote_ratio = votes[best_key] / len(pixels)
+    classified = sum(votes.values())
+    vote_ratio = votes[best_key] / max(classified, 1)
     return best_key, vote_ratio
 
 
-def _crop_region(
-    frame_bgr,
-    center_x: int,
-    center_y: int,
-    radius: int,
-) -> tuple[object, int, int]:
-    height, width = frame_bgr.shape[:2]
-    x1 = max(0, center_x - radius)
-    y1 = max(0, center_y - radius)
-    x2 = min(width, center_x + radius)
-    y2 = min(height, center_y + radius)
-    return frame_bgr[y1:y2, x1:x2], x1, y1
+def _prominence_score(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    shape_conf: float,
+    color_conf: float,
+    frame_width: int,
+    frame_height: int,
+) -> float:
+    """Prefer large, centred, confident detections — the balloon in front."""
+    area = _box_area(x1, y1, x2, y2)
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    focus_x = frame_width / 2
+    focus_y = frame_height * 0.55
+    distance = math.hypot(cx - focus_x, cy - focus_y)
+    max_distance = math.hypot(frame_width, frame_height)
+    centrality = 1.0 - distance / max_distance
+    size_score = min(1.0, area / 15000)
+    return shape_conf * 0.35 + color_conf * 0.45 + centrality * 0.10 + size_score * 0.10
 
 
 def _find_balloon_boxes(frame_bgr) -> list[tuple[int, int, int, int, float]]:
+    height, width = frame_bgr.shape[:2]
     boxes: list[tuple[int, int, int, int, float]] = []
 
-    for center_x, center_y, radius, model_name in SEARCH_WINDOWS:
-        crop, offset_x, offset_y = _crop_region(frame_bgr, center_x, center_y, radius)
-        if crop.size == 0:
-            continue
-
-        model = shape_models[model_name]
+    for model in shape_models.values():
         results = model.predict(
-            crop,
-            imgsz=CROP_INFERENCE_SIZE,
+            frame_bgr,
+            imgsz=INFERENCE_SIZE,
             conf=SHAPE_CONFIDENCE,
             verbose=False,
             device="cpu",
@@ -283,18 +296,11 @@ def _find_balloon_boxes(frame_bgr) -> list[tuple[int, int, int, int, float]]:
         if results.boxes is None:
             continue
 
-        best_conf = -1.0
-        best_box: tuple[int, int, int, int, float] | None = None
         for box in results.boxes:
             confidence = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            abs_box = (x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y)
-            if _box_in_roi(*abs_box) and confidence > best_conf:
-                best_conf = confidence
-                best_box = (*abs_box, confidence)
-
-        if best_box is not None:
-            boxes.append(best_box)
+            if _box_valid(x1, y1, x2, y2, width, height):
+                boxes.append((x1, y1, x2, y2, confidence))
 
     return _nms_boxes(boxes)
 
@@ -302,27 +308,33 @@ def _find_balloon_boxes(frame_bgr) -> list[tuple[int, int, int, int, float]]:
 def detect_objects(frame_rgb) -> list[tuple[str, int, int, int, int, float]]:
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    frame_height, frame_width = frame_bgr.shape[:2]
     balloon_boxes = _find_balloon_boxes(frame_bgr)
 
-    candidates: list[tuple[str, int, int, int, int, float]] = []
+    candidates: list[tuple[str, int, int, int, int, float, float]] = []
     for x1, y1, x2, y2, shape_conf in balloon_boxes:
         color_key, color_conf = _classify_balloon_color(hsv, x1, y1, x2, y2)
         if color_key is None or color_conf < MIN_COLOR_VOTE:
             continue
 
         label = BALLOON_COLORS[color_key]["label"]
-        combined_conf = min(0.99, shape_conf * 0.55 + color_conf * 0.45)
-        candidates.append((label, x1, y1, x2, y2, combined_conf))
+        score = _prominence_score(
+            x1, y1, x2, y2, shape_conf, color_conf, frame_width, frame_height
+        )
+        display_conf = min(0.99, score)
+        candidates.append((label, x1, y1, x2, y2, display_conf, score))
 
-    candidates.sort(key=lambda item: item[5], reverse=True)
+    candidates.sort(key=lambda item: item[6], reverse=True)
 
     used_labels: set[str] = set()
     detections: list[tuple[str, int, int, int, int, float]] = []
-    for label, x1, y1, x2, y2, confidence in candidates:
+    for label, x1, y1, x2, y2, confidence, _score in candidates:
         if label in used_labels:
             continue
         used_labels.add(label)
         detections.append((label, x1, y1, x2, y2, confidence))
+        if len(detections) >= MAX_DETECTIONS:
+            break
 
     return detections
 
@@ -406,7 +418,8 @@ def index():
     </head>
     <body>
         <h1>Mars Rover — Balloon Detection</h1>
-        <p>Hybrid YOLO shape + HSV color detection for <strong>{colors}</strong></p>
+        <p>Detects whatever balloon is in front of the camera —
+           <strong>{colors}</strong></p>
         <img src="/video" width="640">
         <br>
         <button onclick="fetch('/stop', {{method: 'POST'}}).then(() => window.close())">
