@@ -40,7 +40,9 @@ FRAME_SIZE = (640, 480)
 INFERENCE_SIZE = 480  # slightly larger helps distant/small balloons
 SHAPE_CONFIDENCE = 0.01  # models score ~0.01–0.03 on real balloons
 MIN_COLOR_VOTE = 0.35
-MIN_WHITE_VOTE = 0.50  # white balloons are low-saturation — separate threshold
+MIN_WHITE_VOTE = 0.45  # white balloons are low-saturation — separate threshold
+MIN_RGB_WHITE_RATIO = 0.42  # reject white-ish walls / faces that aren't balanced RGB
+MIN_PALE_WHITE_RATIO = 0.40  # bright pale surface (white balloon under blue room lights)
 MIN_ROUNDNESS = 0.58
 MIN_SATURATION_VOTE = 50  # ignore white glare when classifying vivid colours
 MAX_WHITE_SATURATION = 100
@@ -49,7 +51,7 @@ MIN_RGB_WHITE_SUM = 360
 RGB_WHITE_BALANCE = 50
 MIN_BLOB_FILL = 0.38  # balloon surface fills the box; stool legs do not
 MAX_BLOB_PARTS = 2  # legs / clutter split into many blobs
-EDGE_MARGIN = 6  # reject boxes clipped by the frame edge
+EDGE_MARGIN = 28  # reject partial objects / whiteboard strips at frame edge
 MIN_HOUGH_ROUNDNESS = 0.52  # grayscale circle threshold (separate from colour blob)
 MIN_HOUGH_FILL = 0.22  # ignore tiny circles in the corner of a box
 JPEG_QUALITY = 75
@@ -222,6 +224,16 @@ def _color_masks(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> dict[str, np.nd
     }
 
 
+def _pale_balloon_mask(
+    h: np.ndarray,
+    s: np.ndarray,
+    v: np.ndarray,
+) -> np.ndarray:
+    """Bright pale surface — white balloon under coloured lighting looks cyan, not RGB-white."""
+    light_blue = (h >= 82) & (h <= 102) & (s >= 120) & (v >= 160)
+    return (v >= 155) & (s <= 115) & ~light_blue
+
+
 def _rgb_white_mask(
     b: np.ndarray,
     g: np.ndarray,
@@ -249,14 +261,21 @@ def _rgb_white_confidence(bgr_patch: np.ndarray) -> float:
     return float(mask.sum()) / max(total, 1)
 
 
-def _white_color_confidence(hsv_patch: np.ndarray) -> float:
+def _white_color_confidence(hsv_patch: np.ndarray, bgr_patch: np.ndarray) -> float:
+    """White balloon — pale + bright in HSV; RGB balance is optional (room lights tint cyan)."""
     pixels = hsv_patch.reshape(-1, 3)
-    low_sat = pixels[pixels[:, 1] <= MAX_WHITE_SATURATION]
-    if len(low_sat) < 20:
+    if len(pixels) < 20:
         return 0.0
-    h, s, v = low_sat[:, 0], low_sat[:, 1], low_sat[:, 2]
-    white = _color_masks(h, s, v)["white"]
-    return float(white.sum()) / len(low_sat)
+
+    h, s, v = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+    hsv_score = float(_pale_balloon_mask(h, s, v).sum()) / len(pixels)
+    rgb_score = _rgb_white_confidence(bgr_patch)
+
+    if hsv_score >= MIN_PALE_WHITE_RATIO:
+        return min(0.99, hsv_score * 0.82 + rgb_score * 0.18)
+    if rgb_score >= MIN_RGB_WHITE_RATIO:
+        return hsv_score * 0.40 + rgb_score * 0.60
+    return hsv_score * 0.35
 
 
 def _contour_roundness(contour) -> float:
@@ -379,10 +398,12 @@ def _analyze_balloon_shape(
     px_s = patch[:, :, 1]
     px_v = patch[:, :, 2]
     color_mask = _color_masks(px_h, px_s, px_v)[color_key]
-    if color_key == "white" and frame_bgr is not None:
-        patch_bgr = frame_bgr[y1:y2, x1:x2]
-        pb, pg, pr = cv2.split(patch_bgr)
-        color_mask = color_mask | _rgb_white_mask(pb, pg, pr)
+    if color_key == "white":
+        color_mask = color_mask | _pale_balloon_mask(px_h, px_s, px_v)
+        if frame_bgr is not None:
+            patch_bgr = frame_bgr[y1:y2, x1:x2]
+            pb, pg, pr = cv2.split(patch_bgr)
+            color_mask = color_mask | _rgb_white_mask(pb, pg, pr)
     mask = color_mask.astype(np.uint8) * 255
     if not mask.any():
         return False, 0.0
@@ -494,10 +515,7 @@ def _classify_balloon_color(
         center_hsv = patch_hsv
         center_bgr = patch_bgr
 
-    white_conf = max(
-        _white_color_confidence(center_hsv),
-        _rgb_white_confidence(center_bgr),
-    )
+    white_conf = _white_color_confidence(center_hsv, center_bgr)
 
     pixels = center_hsv.reshape(-1, 3)
     saturated = pixels[pixels[:, 1] >= MIN_SATURATION_VOTE]
@@ -522,7 +540,7 @@ def _classify_balloon_color(
             vivid_conf = vivid_votes[best_vivid_key] / max(len(saturated), 1)
 
     if white_conf >= MIN_WHITE_VOTE:
-        if best_vivid_key is None or white_conf >= vivid_conf * 0.72:
+        if best_vivid_key is None or white_conf >= vivid_conf * 0.85:
             return "white", white_conf
 
     if best_vivid_key is not None and vivid_conf >= MIN_COLOR_VOTE:
@@ -572,6 +590,54 @@ def _prominence_score(
     return score
 
 
+def _adjust_white_score(
+    score: float,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    roundness: float,
+    frame_width: int,
+    frame_height: int,
+) -> float:
+    """Score the white balloon on the table — not whiteboard, cone stripe, or laptop glare."""
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    area = _box_area(x1, y1, x2, y2)
+    nx, ny = cx / frame_width, cy / frame_height
+
+    # Whiteboard / ceiling at the top of the frame.
+    if ny < 0.32:
+        score *= 0.30
+    # Cone reflective stripe — small, far-right sliver (not the balloon beside it).
+    elif nx > 0.80 and area < 8000:
+        score *= 0.35
+    # Large white wall / whiteboard beside the cone on the right.
+    elif nx > 0.72 and ny < 0.52 and area > 12000:
+        score *= 0.30
+    # Large whiteboard spans (not a single balloon).
+    elif ny < 0.48 and area > 25000:
+        score *= 0.25
+    # Laptop / face glare on the left.
+    elif nx < 0.38 and ny < 0.50 and area < 8000:
+        score *= 0.35
+    elif nx < 0.32 and ny < 0.55:
+        score *= 0.35
+    # Small white clutter in the frame corners.
+    elif area < 5000 and (nx < 0.18 or nx > 0.82):
+        score *= 0.30
+    # White balloon on the table (next to the traffic cone).
+    elif (
+        0.36 <= nx <= 0.78
+        and 0.36 <= ny <= 0.58
+        and 2000 <= area <= 20000
+        and roundness >= 0.55
+    ):
+        score += 0.20
+
+    return score
+
+
 def _pick_best_candidate(
     candidates: list[tuple[str, str, int, int, int, int, float, float, float, int]],
 ) -> tuple[str, int, int, int, int, float]:
@@ -582,6 +648,32 @@ def _pick_best_candidate(
     best_key = best[1]
     best_score = best[7]
     best_area = best[9]
+
+    if best_key == "white":
+        for alt in ranked[1:]:
+            if (
+                alt[1] == "black"
+                and alt[9] >= 20000
+                and alt[7] >= best_score - 0.15
+                and alt[7] >= best_score * 0.85
+            ):
+                best = alt
+                best_key = alt[1]
+                best_score = alt[7]
+                best_area = alt[9]
+                break
+
+        if best_key == "white":
+            for alt in ranked[1:]:
+                if (
+                    alt[1] in vivid
+                    and alt[1] != "white"
+                    and alt[8] >= 0.80
+                    and alt[7] >= 0.70
+                    and alt[7] >= best_score * 0.72
+                ):
+                    best = alt
+                    break
 
     for alt in ranked[1:]:
         alt_key = alt[1]
@@ -631,13 +723,8 @@ def _find_round_color_blobs(
     px_h = hsv[:, :, 0]
     px_s = hsv[:, :, 1]
     px_v = hsv[:, :, 2]
-    px_b, px_g, px_r = cv2.split(frame_bgr)
-    rgb_white = _rgb_white_mask(px_b, px_g, px_r)
 
-    color_masks = _color_masks(px_h, px_s, px_v)
-    color_masks["white"] = color_masks["white"] | rgb_white
-
-    for color_key, mask in color_masks.items():
+    for color_key, mask in _color_masks(px_h, px_s, px_v).items():
         binary = mask.astype(np.uint8) * 255
         ksize = 3 if color_key == "white" else 5
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
@@ -662,23 +749,44 @@ def _find_round_color_blobs(
     return boxes
 
 
-def _find_hough_balloon_boxes(
+def _hough_white_in_roi(
     frame_bgr: np.ndarray,
+    hsv: np.ndarray,
+    rx1: int,
+    ry1: int,
+    rx2: int,
+    ry2: int,
     frame_width: int,
     frame_height: int,
 ) -> list[tuple[int, int, int, int, float]]:
-    """Find round balloon shapes via grayscale circles — helps white balloons YOLO misses."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    """Fast circle search in a cropped region — full-frame Hough takes ~3s on Pi."""
+    rx1 = max(0, min(rx1, frame_width - 1))
+    ry1 = max(0, min(ry1, frame_height - 1))
+    rx2 = max(rx1 + 1, min(rx2, frame_width))
+    ry2 = max(ry1 + 1, min(ry2, frame_height))
+
+    roi = frame_bgr[ry1:ry2, rx1:rx2]
+    if roi.size == 0:
+        return []
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (9, 9), 2)
+    rh, rw = gray.shape
+    if rh < 40 or rw < 40:
+        return []
+
     boxes: list[tuple[int, int, int, int, float]] = []
     seen: list[tuple[int, int, int, int]] = []
 
-    for min_r, max_r in ((18, 70), (35, 120), (55, 180)):
+    for min_r, max_r in ((12, 55), (25, 90)):
+        max_r = min(max_r, min(rw, rh) // 2)
+        if max_r <= min_r:
+            continue
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=max(min_r * 2, 40),
+            minDist=max(min_r * 2, 30),
             param1=80,
             param2=28,
             minRadius=min_r,
@@ -688,7 +796,9 @@ def _find_hough_balloon_boxes(
             continue
 
         for cx, cy, radius in circles[0]:
-            cx_f, cy_f, radius_f = float(cx), float(cy), float(radius)
+            cx_f = float(cx) + rx1
+            cy_f = float(cy) + ry1
+            radius_f = float(radius)
             x1 = int(cx_f - radius_f * 1.08)
             y1 = int(cy_f - radius_f * 1.08)
             x2 = int(cx_f + radius_f * 1.08)
@@ -697,11 +807,38 @@ def _find_hough_balloon_boxes(
                 continue
             if any(_iou((x1, y1, x2, y2), kept) > 0.35 for kept in seen):
                 continue
+
+            color_key, color_conf = _classify_balloon_color(
+                hsv, frame_bgr, x1, y1, x2, y2
+            )
+            if color_key != "white" or color_conf < MIN_WHITE_VOTE:
+                continue
+            ok, roundness = _analyze_balloon_shape_from_color_or_hough(
+                hsv, frame_bgr, x1, y1, x2, y2, "white"
+            )
+            if not ok:
+                continue
+
             seen.append((x1, y1, x2, y2))
-            fill = (math.pi * radius_f * radius_f) / max((x2 - x1) * (y2 - y1), 1)
-            boxes.append((x1, y1, x2, y2, min(0.05, fill * 0.08)))
+            boxes.append((x1, y1, x2, y2, roundness * 0.04))
 
     return boxes
+
+
+def _find_hough_balloon_boxes(
+    frame_bgr: np.ndarray,
+    hsv: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+) -> list[tuple[int, int, int, int, float]]:
+    """White balloon beside the traffic cone — search table zone only (not full frame)."""
+    tx1 = int(frame_width * 0.34)
+    ty1 = int(frame_height * 0.24)
+    tx2 = int(frame_width * 0.84)
+    ty2 = int(frame_height * 0.60)
+    return _hough_white_in_roi(
+        frame_bgr, hsv, tx1, ty1, tx2, ty2, frame_width, frame_height
+    )
 
 
 def _find_balloon_boxes(
@@ -727,7 +864,7 @@ def _find_balloon_boxes(
                 boxes.append((x1, y1, x2, y2, confidence))
 
     boxes.extend(_find_round_color_blobs(hsv, frame_bgr, width, height))
-    boxes.extend(_find_hough_balloon_boxes(frame_bgr, width, height))
+    boxes.extend(_find_hough_balloon_boxes(frame_bgr, hsv, width, height))
 
     deduped: list[tuple[int, int, int, int, float]] = []
     for box in sorted(boxes, key=lambda item: item[4], reverse=True):
@@ -773,6 +910,10 @@ def detect_objects(frame_rgb) -> list[tuple[str, int, int, int, int, float]]:
         score = _prominence_score(
             x1, y1, x2, y2, color_conf, roundness, frame_width, frame_height
         )
+        if color_key == "white":
+            score = _adjust_white_score(
+                score, x1, y1, x2, y2, roundness, frame_width, frame_height
+            )
         display_conf = min(0.99, score)
         if display_conf < 0.55:
             continue
@@ -820,12 +961,14 @@ def _detection_worker() -> None:
     global _pending_frame, _latest_detections
 
     while _running:
+        frame = None
         with _frame_lock:
-            frame = _pending_frame
-            _pending_frame = None
+            while _pending_frame is not None:
+                frame = _pending_frame
+                _pending_frame = None
 
         if frame is None:
-            time.sleep(0.005)
+            time.sleep(0.002)
             continue
 
         detections = detect_objects(frame)
